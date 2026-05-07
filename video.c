@@ -46,9 +46,43 @@ bool should_exit = false;
 float quality_factor = 1.0f;
 RK_CODEC_ID_E encodec_type = RK_VIDEO_ID_AVC;
 
+static VideoRcConfig video_rc_config = {
+    .h264 = {
+        .s32FirstFrameStartQp = 50,
+        .u32StepQp = 48,
+        .u32MinQp = 48,
+        .u32MaxQp = 51,
+        .u32MinIQp = 48,
+        .u32MaxIQp = 51,
+        .s32DeltIpQp = 7,
+        .s32MaxReEncodeTimes = 2,
+        .u32FrmMaxQp = 51,
+        .u32FrmMinQp = 48,
+        .u32FrmMinIQp = 51,
+        .u32FrmMaxIQp = 48,
+        .u32MotionStaticSwitchFrmQp = 50,
+    },
+    .h265 = {
+        .s32FirstFrameStartQp = 50,
+        .u32StepQp = 48,
+        .u32MinQp = 48,
+        .u32MaxQp = 51,
+        .u32MinIQp = 48,
+        .u32MaxIQp = 51,
+        .s32DeltIpQp = 7,
+        .s32MaxReEncodeTimes = 2,
+        .u32FrmMaxQp = 51,
+        .u32FrmMinQp = 48,
+        .u32FrmMinIQp = 51,
+        .u32FrmMaxIQp = 48,
+        .u32MotionStaticSwitchFrmQp = 50,
+    },
+};
+
 static void *venc_read_stream(void *arg);
 static void* yolo_infer_thread(void* arg);
 static void *run_preview_socket_thread(void *arg);
+static int32_t venc_start(RK_CODEC_ID_E enType, int32_t bitrate, int32_t max_bitrate, int32_t width, int32_t height, const VideoRcConfig *rc);
 
 static pthread_t* yolo_thread = NULL;
 static volatile bool yolo_running = false;
@@ -100,6 +134,39 @@ double calculate_bitrate(float bitrate_factor, int width, int height)
     return bitrate;
 }
 
+static void populate_rc_param(VENC_RC_PARAM_S *stRcParam, RK_CODEC_ID_E enType, const VideoRcConfig *rc)
+{
+    memset(stRcParam, 0, sizeof(VENC_RC_PARAM_S));
+    stRcParam->s32FirstFrameStartQp = rc->h264.s32FirstFrameStartQp;
+
+    const RcQpParams *qp = (enType == RK_VIDEO_ID_HEVC) ? &rc->h265 : &rc->h264;
+    stRcParam->stParamH264.u32StepQp = qp->u32StepQp;
+    stRcParam->stParamH264.u32MinQp = qp->u32MinQp;
+    stRcParam->stParamH264.u32MaxQp = qp->u32MaxQp;
+    stRcParam->stParamH264.u32MinIQp = qp->u32MinIQp;
+    stRcParam->stParamH264.u32MaxIQp = qp->u32MaxIQp;
+    stRcParam->stParamH264.s32DeltIpQp = qp->s32DeltIpQp;
+    stRcParam->stParamH264.s32MaxReEncodeTimes = qp->s32MaxReEncodeTimes;
+    stRcParam->stParamH264.u32FrmMaxQp = qp->u32FrmMaxQp;
+    stRcParam->stParamH264.u32FrmMinQp = qp->u32FrmMinQp;
+    stRcParam->stParamH264.u32FrmMinIQp = qp->u32FrmMinIQp;
+    stRcParam->stParamH264.u32FrmMaxIQp = qp->u32FrmMaxIQp;
+    stRcParam->stParamH264.u32MotionStaticSwitchFrmQp = qp->u32MotionStaticSwitchFrmQp;
+
+    stRcParam->stParamH265.u32StepQp = qp->u32StepQp;
+    stRcParam->stParamH265.u32MinQp = qp->u32MinQp;
+    stRcParam->stParamH265.u32MaxQp = qp->u32MaxQp;
+    stRcParam->stParamH265.u32MinIQp = qp->u32MinIQp;
+    stRcParam->stParamH265.u32MaxIQp = qp->u32MaxIQp;
+    stRcParam->stParamH265.s32DeltIpQp = qp->s32DeltIpQp;
+    stRcParam->stParamH265.s32MaxReEncodeTimes = qp->s32MaxReEncodeTimes;
+    stRcParam->stParamH265.u32FrmMaxQp = qp->u32FrmMaxQp;
+    stRcParam->stParamH265.u32FrmMinQp = qp->u32FrmMinQp;
+    stRcParam->stParamH265.u32FrmMinIQp = qp->u32FrmMinIQp;
+    stRcParam->stParamH265.u32FrmMaxIQp = qp->u32FrmMaxIQp;
+    stRcParam->stParamH265.u32MotionStaticSwitchFrmQp = qp->u32MotionStaticSwitchFrmQp;
+}
+
 static void populate_venc_attr(VENC_CHN_ATTR_S *stAttr, RK_CODEC_ID_E enType, RK_U32 bitrate, RK_U32 max_bitrate, RK_U32 width, RK_U32 height)
 {
     memset(stAttr, 0, sizeof(VENC_CHN_ATTR_S));
@@ -136,17 +203,63 @@ static void populate_venc_attr(VENC_CHN_ATTR_S *stAttr, RK_CODEC_ID_E enType, RK
 
 pthread_t *venc_read_thread = NULL;
 volatile bool venc_running = false;
-static int32_t venc_start(RK_CODEC_ID_E enType, int32_t bitrate, int32_t max_bitrate, int32_t width, int32_t height)
+static int32_t venc_start(RK_CODEC_ID_E enType, int32_t bitrate, int32_t max_bitrate, int32_t width, int32_t height, const VideoRcConfig *rc)
 {
     int32_t ret;
     VENC_CHN_ATTR_S stAttr;
     populate_venc_attr(&stAttr, enType, bitrate, max_bitrate, width, height);
+    VENC_RC_PARAM_S stRcParam;
+    populate_rc_param(&stRcParam, enType, rc);
 
     ret = RK_MPI_VENC_CreateChn(VENC_CHANNEL, &stAttr);
     if (ret < 0)
     {
         RK_LOGE("error RK_MPI_VENC_CreateChn, %d", ret);
         return ret;
+    }
+
+
+    ret = RK_MPI_VENC_GetRcParam(VENC_CHANNEL, &stRcParam);
+    if (ret < 0)
+    {
+        RK_LOGE("error RK_MPI_VENC_GetRcParam, %d", ret);
+    }
+    else
+    {
+        printf("===== VENC RC PARAM (GET) =====\n");
+        printf("s32FirstFrameStartQp: %d\n", stRcParam.s32FirstFrameStartQp);
+        printf("stParamH264.u32StepQp: %u\n", stRcParam.stParamH264.u32StepQp);
+        printf("stParamH264.u32MinQp: %u\n", stRcParam.stParamH264.u32MinQp);
+        printf("stParamH264.u32MaxQp: %u\n", stRcParam.stParamH264.u32MaxQp);
+        printf("stParamH264.u32MinIQp: %u\n", stRcParam.stParamH264.u32MinIQp);
+        printf("stParamH264.u32MaxIQp: %u\n", stRcParam.stParamH264.u32MaxIQp);
+        printf("stParamH264.s32DeltIpQp: %d\n", stRcParam.stParamH264.s32DeltIpQp);
+        printf("stParamH264.s32MaxReEncodeTimes: %d\n", stRcParam.stParamH264.s32MaxReEncodeTimes);
+        printf("stParamH264.u32FrmMaxQp: %u\n", stRcParam.stParamH264.u32FrmMaxQp);
+        printf("stParamH264.u32FrmMinQp: %u\n", stRcParam.stParamH264.u32FrmMinQp);
+        printf("stParamH264.u32FrmMinIQp: %u\n", stRcParam.stParamH264.u32FrmMinIQp);
+        printf("stParamH264.u32FrmMaxIQp: %u\n", stRcParam.stParamH264.u32FrmMaxIQp);
+        printf("stParamH264.u32MotionStaticSwitchFrmQp: %u\n", stRcParam.stParamH264.u32MotionStaticSwitchFrmQp);
+
+        printf("stParamH265.u32StepQp: %u\n", stRcParam.stParamH265.u32StepQp);
+        printf("stParamH265.u32MinQp: %u\n", stRcParam.stParamH265.u32MinQp);
+        printf("stParamH265.u32MaxQp: %u\n", stRcParam.stParamH265.u32MaxQp);
+        printf("stParamH265.u32MinIQp: %u\n", stRcParam.stParamH265.u32MinIQp);
+        printf("stParamH265.u32MaxIQp: %u\n", stRcParam.stParamH265.u32MaxIQp);
+        printf("stParamH265.s32DeltIpQp: %d\n", stRcParam.stParamH265.s32DeltIpQp);
+        printf("stParamH265.s32MaxReEncodeTimes: %d\n", stRcParam.stParamH265.s32MaxReEncodeTimes);
+        printf("stParamH265.u32FrmMaxQp: %u\n", stRcParam.stParamH265.u32FrmMaxQp);
+        printf("stParamH265.u32FrmMinQp: %u\n", stRcParam.stParamH265.u32FrmMinQp);
+        printf("stParamH265.u32FrmMinIQp: %u\n", stRcParam.stParamH265.u32FrmMinIQp);
+        printf("stParamH265.u32FrmMaxIQp: %u\n", stRcParam.stParamH265.u32FrmMaxIQp);
+        printf("stParamH265.u32MotionStaticSwitchFrmQp: %u\n", stRcParam.stParamH265.u32MotionStaticSwitchFrmQp);
+        printf("=============================\n");
+    }
+
+    ret = RK_MPI_VENC_SetRcParam(VENC_CHANNEL, &stRcParam);
+    if (ret < 0)
+    {
+        RK_LOGE("error RK_MPI_VENC_SetRcParam, %d", ret);
     }
 
     VENC_RECV_PIC_PARAM_S stRecvParam;
@@ -574,7 +687,7 @@ void *run_video_stream(void *arg)
         // Set VENC parameters
         int32_t bitrate = calculate_bitrate(quality_factor, width, height);
         RK_CODEC_ID_E enType = encodec_type;
-        RK_S32 ret = venc_start(enType, bitrate, bitrate * 2, width, height);
+        RK_S32 ret = venc_start(enType, bitrate, bitrate * 2, width, height, &video_rc_config);
         if (ret != RK_SUCCESS)
         {
         RK_LOGE("Set VENC parameters failed with %#x", ret);
@@ -962,6 +1075,24 @@ void video_set_yolo_enable(int enable)
         overlay_draw_detections(yolo_model_w, yolo_model_h, NULL, 0, 0x00FF00FF);
     }
 }
+
+void video_set_rc(const VideoRcConfig *rc)
+{
+    video_rc_config = *rc;
+
+    if (streaming_flag == true)
+    {
+        printf("restarting video streaming due to RC config change\n");
+        video_stop_streaming();
+        video_start_streaming();
+    }
+}
+
+void video_get_rc(VideoRcConfig *rc)
+{
+    *rc = video_rc_config;
+}
+
 static void* yolo_infer_thread(void* arg) {
     yolo_input_shape(&yolo_model_h, &yolo_model_w, &yolo_model_c);
     size_t expect = (size_t)yolo_model_h * (size_t)yolo_model_w * (size_t)yolo_model_c;

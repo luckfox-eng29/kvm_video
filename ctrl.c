@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include "frozen.h"
 #include "video.h"
@@ -215,6 +216,146 @@ void *handle_client(void *arg)
                     {
                         write_json_error(ctrl_client_fd, seq, "invalid enable");
                     }
+                }
+                else if (strcmp("set_video_rc", method) == 0)
+                {
+                    VideoRcConfig rc;
+                    memset(&rc, 0, sizeof(rc));
+
+                    int parsed = json_scanf(buf_in, n,
+                        "{params: {"
+                        "h264: {"
+                        "s32FirstFrameStartQp: %d,"
+                        "u32StepQp: %u,"
+                        "u32MinQp: %u,"
+                        "u32MaxQp: %u,"
+                        "u32MinIQp: %u,"
+                        "u32MaxIQp: %u,"
+                        "s32DeltIpQp: %d,"
+                        "s32MaxReEncodeTimes: %d,"
+                        "u32FrmMaxQp: %u,"
+                        "u32FrmMinQp: %u,"
+                        "u32FrmMinIQp: %u,"
+                        "u32FrmMaxIQp: %u,"
+                        "u32MotionStaticSwitchFrmQp: %u"
+                        "},"
+                        "h265: {"
+                        "s32FirstFrameStartQp: %d,"
+                        "u32StepQp: %u,"
+                        "u32MinQp: %u,"
+                        "u32MaxQp: %u,"
+                        "u32MinIQp: %u,"
+                        "u32MaxIQp: %u,"
+                        "s32DeltIpQp: %d,"
+                        "s32MaxReEncodeTimes: %d,"
+                        "u32FrmMaxQp: %u,"
+                        "u32FrmMinQp: %u,"
+                        "u32FrmMinIQp: %u,"
+                        "u32FrmMaxIQp: %u,"
+                        "u32MotionStaticSwitchFrmQp: %u"
+                        "}"
+                        "}}",
+                        &rc.h264.s32FirstFrameStartQp,
+                        &rc.h264.u32StepQp,
+                        &rc.h264.u32MinQp,
+                        &rc.h264.u32MaxQp,
+                        &rc.h264.u32MinIQp,
+                        &rc.h264.u32MaxIQp,
+                        &rc.h264.s32DeltIpQp,
+                        &rc.h264.s32MaxReEncodeTimes,
+                        &rc.h264.u32FrmMaxQp,
+                        &rc.h264.u32FrmMinQp,
+                        &rc.h264.u32FrmMinIQp,
+                        &rc.h264.u32FrmMaxIQp,
+                        &rc.h264.u32MotionStaticSwitchFrmQp,
+                        &rc.h265.s32FirstFrameStartQp,
+                        &rc.h265.u32StepQp,
+                        &rc.h265.u32MinQp,
+                        &rc.h265.u32MaxQp,
+                        &rc.h265.u32MinIQp,
+                        &rc.h265.u32MaxIQp,
+                        &rc.h265.s32DeltIpQp,
+                        &rc.h265.s32MaxReEncodeTimes,
+                        &rc.h265.u32FrmMaxQp,
+                        &rc.h265.u32FrmMinQp,
+                        &rc.h265.u32FrmMinIQp,
+                        &rc.h265.u32FrmMaxIQp,
+                        &rc.h265.u32MotionStaticSwitchFrmQp);
+
+                    if (parsed < 26)
+                    {
+                        write_json_error(ctrl_client_fd, seq, "invalid RC params");
+                    }
+                    else
+                    {
+                        video_set_rc(&rc);
+                        write_json(ctrl_client_fd, "{seq: %d}", seq);
+                    }
+                }
+                else if (strcmp("get_video_rc", method) == 0)
+                {
+                    VideoRcConfig rc;
+                    video_get_rc(&rc);
+                    write_json(ctrl_client_fd,
+                        "{seq: %d, result: {"
+                        "h264: {"
+                        "s32FirstFrameStartQp: %d,"
+                        "u32StepQp: %u,"
+                        "u32MinQp: %u,"
+                        "u32MaxQp: %u,"
+                        "u32MinIQp: %u,"
+                        "u32MaxIQp: %u,"
+                        "s32DeltIpQp: %d,"
+                        "s32MaxReEncodeTimes: %d,"
+                        "u32FrmMaxQp: %u,"
+                        "u32FrmMinQp: %u,"
+                        "u32FrmMinIQp: %u,"
+                        "u32FrmMaxIQp: %u,"
+                        "u32MotionStaticSwitchFrmQp: %u"
+                        "},"
+                        "h265: {"
+                        "s32FirstFrameStartQp: %d,"
+                        "u32StepQp: %u,"
+                        "u32MinQp: %u,"
+                        "u32MaxQp: %u,"
+                        "u32MinIQp: %u,"
+                        "u32MaxIQp: %u,"
+                        "s32DeltIpQp: %d,"
+                        "s32MaxReEncodeTimes: %d,"
+                        "u32FrmMaxQp: %u,"
+                        "u32FrmMinQp: %u,"
+                        "u32FrmMinIQp: %u,"
+                        "u32FrmMaxIQp: %u,"
+                        "u32MotionStaticSwitchFrmQp: %u"
+                        "}"
+                        "}}",
+                        seq,
+                        rc.h264.s32FirstFrameStartQp,
+                        rc.h264.u32StepQp,
+                        rc.h264.u32MinQp,
+                        rc.h264.u32MaxQp,
+                        rc.h264.u32MinIQp,
+                        rc.h264.u32MaxIQp,
+                        rc.h264.s32DeltIpQp,
+                        rc.h264.s32MaxReEncodeTimes,
+                        rc.h264.u32FrmMaxQp,
+                        rc.h264.u32FrmMinQp,
+                        rc.h264.u32FrmMinIQp,
+                        rc.h264.u32FrmMaxIQp,
+                        rc.h264.u32MotionStaticSwitchFrmQp,
+                        rc.h265.s32FirstFrameStartQp,
+                        rc.h265.u32StepQp,
+                        rc.h265.u32MinQp,
+                        rc.h265.u32MaxQp,
+                        rc.h265.u32MinIQp,
+                        rc.h265.u32MaxIQp,
+                        rc.h265.s32DeltIpQp,
+                        rc.h265.s32MaxReEncodeTimes,
+                        rc.h265.u32FrmMaxQp,
+                        rc.h265.u32FrmMinQp,
+                        rc.h265.u32FrmMinIQp,
+                        rc.h265.u32FrmMaxIQp,
+                        rc.h265.u32MotionStaticSwitchFrmQp);
                 }
                 else if (strcmp("set_edid", method) == 0)
                 {

@@ -53,6 +53,14 @@ static int write_input_video_state(int fd)
                       "video_input_state", state.ready, state.error, state.width, state.height, state.frame_per_second);
 }
 
+void report_jpeg_ready(const char *path)
+{
+    if (ctrl_client_fd > 0)
+    {
+        write_json(ctrl_client_fd, "{event: %Q, data: {path: %Q}}", "jpeg_ready", path);
+    }
+}
+
 void report_video_format(bool ready, const char *error, u_int16_t width, u_int16_t height, double frame_per_second)
 {
     state.ready = ready;
@@ -380,6 +388,33 @@ void *handle_client(void *arg)
                     else
                     {
                         write_json_error(ctrl_client_fd, seq, "invalid edid");
+                    }
+                }
+                else if (strcmp("jpeg_capture_start", method) == 0)
+                {
+                    if (video_jpeg_capture(JPEG_CONTINUOUS) < 0)
+                    {
+                        write_json_error(ctrl_client_fd, seq, "capture start failed");
+                    }
+                    else
+                    {
+                        write_json(ctrl_client_fd, "{seq: %d}", seq);
+                    }
+                }
+                else if (strcmp("jpeg_capture_stop", method) == 0)
+                {
+                    video_jpeg_stop();
+                    write_json(ctrl_client_fd, "{seq: %d}", seq);
+                }
+                else if (strcmp("jpeg_take_snapshot", method) == 0)
+                {
+                    if (video_jpeg_get() < 0)
+                    {
+                        write_json_error(ctrl_client_fd, seq, "snapshot failed");
+                    }
+                    else
+                    {
+                        write_json(ctrl_client_fd, "{seq: %d}", seq);
                     }
                 }
                 else if (strcmp("get_edid", method) == 0)

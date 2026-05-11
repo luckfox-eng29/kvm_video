@@ -38,13 +38,28 @@
 #define RK_ALIGN_16(x) RK_ALIGN(x, 16)
 #define RK_ALIGN_32(x) RK_ALIGN(x, 32)
 
+#define COMBO_JPEG_CHN 1
+
 int sub_dev_fd = -1;
 #define VENC_CHANNEL 0
 MB_POOL memPool = MB_INVALID_POOLID;
 
+static pthread_t *jpeg_thread = NULL;
+static volatile bool jpeg_running = false;
+static volatile bool jpeg_initialized = false;
+static JpegMode jpeg_mode = JPEG_SINGLE_SHOT;
+static pthread_mutex_t jpeg_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t jpeg_cond = PTHREAD_COND_INITIALIZER;
+static bool jpeg_trigger = false;
+static RK_U32 jpeg_width = 0;
+static RK_U32 jpeg_height = 0;
+
 bool should_exit = false;
 float quality_factor = 1.0f;
 RK_CODEC_ID_E encodec_type = RK_VIDEO_ID_AVC;
+
+uint32_t detected_width, detected_height;
+bool detected_signal = false, streaming_flag = false;
 
 static VideoRcConfig video_rc_config = {
     .h264 = {
@@ -83,6 +98,9 @@ static void *venc_read_stream(void *arg);
 static void* yolo_infer_thread(void* arg);
 static void *run_preview_socket_thread(void *arg);
 static int32_t venc_start(RK_CODEC_ID_E enType, int32_t bitrate, int32_t max_bitrate, int32_t width, int32_t height, const VideoRcConfig *rc);
+static int32_t combo_jpeg_init(RK_U32 width, RK_U32 height);
+static int32_t combo_jpeg_stop(void);
+static void *combo_jpeg_get_stream(void *arg);
 
 static pthread_t* yolo_thread = NULL;
 static volatile bool yolo_running = false;
@@ -272,6 +290,13 @@ static int32_t venc_start(RK_CODEC_ID_E enType, int32_t bitrate, int32_t max_bit
         return ret;
     }
 
+    ret = combo_jpeg_init(width, height);
+    if (ret < 0)
+    {
+        RK_LOGE("error combo_jpeg_init, %d", ret);
+        return ret;
+    }
+
     venc_running = true;
     venc_read_thread = malloc(sizeof(pthread_t));
     if (pthread_create(venc_read_thread, NULL, venc_read_stream, NULL) != 0)
@@ -286,6 +311,11 @@ static int32_t venc_start(RK_CODEC_ID_E enType, int32_t bitrate, int32_t max_bit
 static int32_t venc_stop()
 {
     venc_running = false;
+
+    if (jpeg_running) {
+        jpeg_running = false;
+        combo_jpeg_stop();
+    }
 
     int32_t ret;
     ret = RK_MPI_VENC_StopRecvFrame(VENC_CHANNEL);
@@ -310,6 +340,228 @@ static int32_t venc_stop()
     }
 
     return RK_SUCCESS;
+}
+
+static int32_t combo_jpeg_init(RK_U32 width, RK_U32 height)
+{
+    int32_t ret;
+    VENC_CHN_ATTR_S stAttr;
+    VENC_COMBO_ATTR_S stComboAttr;
+    VENC_RECV_PIC_PARAM_S stRecvParam;
+
+    jpeg_width = width;
+    jpeg_height = height;
+
+    if (jpeg_initialized) {
+        return RK_SUCCESS;
+    }
+
+    memset(&stAttr, 0, sizeof(VENC_CHN_ATTR_S));
+    stAttr.stVencAttr.enType = RK_VIDEO_ID_JPEG;
+    stAttr.stVencAttr.enPixelFormat = RK_FMT_YUV422_YUYV;
+    stAttr.stVencAttr.u32MaxPicWidth = width;
+    stAttr.stVencAttr.u32MaxPicHeight = height;
+    stAttr.stVencAttr.u32PicWidth = width;
+    stAttr.stVencAttr.u32PicHeight = height;
+    stAttr.stVencAttr.u32VirWidth = RK_ALIGN_2(width);
+    stAttr.stVencAttr.u32VirHeight = RK_ALIGN_2(height);
+    stAttr.stVencAttr.u32StreamBufCnt = 3;
+    stAttr.stVencAttr.u32BufSize = width * height * 3 / 2;
+    stAttr.stVencAttr.stAttrJpege.bSupportDCF = RK_FALSE;
+    stAttr.stVencAttr.stAttrJpege.stMPFCfg.u8LargeThumbNailNum = 0;
+    stAttr.stVencAttr.stAttrJpege.enReceiveMode = VENC_PIC_RECEIVE_SINGLE;
+    stAttr.stGopAttr.enGopMode = VENC_GOPMODE_INIT;
+
+    ret = RK_MPI_VENC_CreateChn(COMBO_JPEG_CHN, &stAttr);
+    if (ret != RK_SUCCESS) {
+        RK_LOGE("RK_MPI_VENC_CreateChn JPEG failed: %x", ret);
+        return ret;
+    }
+
+    memset(&stRecvParam, 0, sizeof(VENC_RECV_PIC_PARAM_S));
+    stRecvParam.s32RecvPicNum = 1;
+    ret = RK_MPI_VENC_StartRecvFrame(COMBO_JPEG_CHN, &stRecvParam);
+    if (ret != RK_SUCCESS) {
+        RK_LOGE("RK_MPI_VENC_StartRecvFrame JPEG failed: %x", ret);
+        return ret;
+    }
+
+    memset(&stComboAttr, 0, sizeof(VENC_COMBO_ATTR_S));
+    stComboAttr.bEnable = RK_TRUE;
+    stComboAttr.s32ChnId = VENC_CHANNEL;
+    ret = RK_MPI_VENC_SetComboAttr(COMBO_JPEG_CHN, &stComboAttr);
+    if (ret != RK_SUCCESS) {
+        RK_LOGE("RK_MPI_VENC_SetComboAttr failed: %x", ret);
+        return ret;
+    }
+
+    jpeg_initialized = true;
+    return RK_SUCCESS;
+}
+
+static int32_t combo_jpeg_stop(void)
+{
+    int32_t ret;
+    ret = RK_MPI_VENC_StopRecvFrame(COMBO_JPEG_CHN);
+    if (ret != RK_SUCCESS) {
+        RK_LOGE("Failed to stop JPEG recv: %x", ret);
+    }
+    ret = RK_MPI_VENC_DestroyChn(COMBO_JPEG_CHN);
+    if (ret != RK_SUCCESS) {
+        RK_LOGE("Failed to destroy JPEG chn: %x", ret);
+    }
+    jpeg_initialized = false;
+    return ret;
+}
+
+static void *combo_jpeg_get_stream(void *arg)
+{
+    (void)arg;
+    FILE *fp = NULL;
+    VENC_STREAM_S stFrame;
+    VENC_RECV_PIC_PARAM_S stRecvParam;
+
+    while (!venc_running) {
+        usleep(10000);
+    }
+
+    stFrame.pstPack = malloc(sizeof(VENC_PACK_S));
+    if (!stFrame.pstPack) {
+        RK_LOGE("malloc for stFrame.pstPack failed");
+        return NULL;
+    }
+
+    while (venc_running) {
+        pthread_mutex_lock(&jpeg_mutex);
+        if (jpeg_mode == JPEG_SINGLE_SHOT && !jpeg_trigger) {
+            pthread_mutex_unlock(&jpeg_mutex);
+            usleep(10000);
+            continue;
+        }
+        if (!jpeg_running) {
+            pthread_mutex_unlock(&jpeg_mutex);
+            usleep(10000);
+            continue;
+        }
+        pthread_mutex_unlock(&jpeg_mutex);
+
+        int s32Ret = RK_MPI_VENC_GetStream(COMBO_JPEG_CHN, &stFrame, 2000);
+        if (s32Ret == RK_SUCCESS) {
+            void *pData = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
+
+            const char *path = "/userdata/picokvm/screenshot/kvm_screenshot.jpg";
+            fp = fopen(path, "wb");
+            if (fp) {
+                fwrite(pData, 1, stFrame.pstPack->u32Len, fp);
+                fflush(fp);
+                fclose(fp);
+                fp = NULL;
+                RK_LOGD("JPEG snapshot saved to %s", path);
+                // notify Go side that the file is ready
+                report_jpeg_ready(path);
+            } else {
+                RK_LOGE("Failed to open %s: %s", path, strerror(errno));
+            }
+
+            RK_MPI_VENC_ReleaseStream(COMBO_JPEG_CHN, &stFrame);
+
+            pthread_mutex_lock(&jpeg_mutex);
+            if (jpeg_mode == JPEG_SINGLE_SHOT) {
+                jpeg_trigger = false;
+                RK_MPI_VENC_StopRecvFrame(COMBO_JPEG_CHN);
+            } else {
+                RK_MPI_VENC_StopRecvFrame(COMBO_JPEG_CHN);
+                memset(&stRecvParam, 0, sizeof(VENC_RECV_PIC_PARAM_S));
+                stRecvParam.s32RecvPicNum = 1;
+                RK_MPI_VENC_StartRecvFrame(COMBO_JPEG_CHN, &stRecvParam);
+            }
+            pthread_mutex_unlock(&jpeg_mutex);
+        } else {
+            RK_LOGE("RK_MPI_VENC_GetStream JPEG failed: %x", s32Ret);
+        }
+    }
+
+    if (stFrame.pstPack) {
+        free(stFrame.pstPack);
+        stFrame.pstPack = NULL;
+    }
+    return NULL;
+}
+
+int video_jpeg_capture(JpegMode mode)
+{
+    if (!streaming_flag || !detected_signal) {
+        RK_LOGE("Video streaming not active");
+        return -1;
+    }
+
+    pthread_mutex_lock(&jpeg_mutex);
+    if (jpeg_thread == NULL) {
+        jpeg_thread = malloc(sizeof(pthread_t));
+        if (pthread_create(jpeg_thread, NULL, combo_jpeg_get_stream, NULL) != 0) {
+            RK_LOGE("Failed to create jpeg_thread");
+            free(jpeg_thread);
+            jpeg_thread = NULL;
+            pthread_mutex_unlock(&jpeg_mutex);
+            return -1;
+        }
+        RK_LOGD("JPEG thread created");
+    }
+
+    jpeg_mode = mode;
+    jpeg_running = true;
+    pthread_mutex_unlock(&jpeg_mutex);
+
+    return 0;
+}
+
+int video_jpeg_get(void)
+{
+    if (!streaming_flag || !detected_signal) {
+        RK_LOGE("Video streaming not active");
+        return -1;
+    }
+
+    pthread_mutex_lock(&jpeg_mutex);
+    if (jpeg_thread == NULL) {
+        jpeg_thread = malloc(sizeof(pthread_t));
+        if (pthread_create(jpeg_thread, NULL, combo_jpeg_get_stream, NULL) != 0) {
+            RK_LOGE("Failed to create jpeg_thread");
+            free(jpeg_thread);
+            jpeg_thread = NULL;
+            pthread_mutex_unlock(&jpeg_mutex);
+            return -1;
+        }
+        RK_LOGD("JPEG thread created");
+    }
+
+    jpeg_trigger = true;
+    jpeg_mode = JPEG_SINGLE_SHOT;
+    jpeg_running = true;
+
+    if (jpeg_initialized) {
+        VENC_RECV_PIC_PARAM_S stRecvParam;
+        memset(&stRecvParam, 0, sizeof(VENC_RECV_PIC_PARAM_S));
+        stRecvParam.s32RecvPicNum = 1;
+        RK_MPI_VENC_StartRecvFrame(COMBO_JPEG_CHN, &stRecvParam);
+    }
+
+    pthread_mutex_unlock(&jpeg_mutex);
+
+    return 0;
+}
+
+void video_jpeg_stop(void)
+{
+    pthread_mutex_lock(&jpeg_mutex);
+    jpeg_running = false;
+    pthread_mutex_unlock(&jpeg_mutex);
+
+    if (jpeg_thread != NULL) {
+        pthread_join(*jpeg_thread, NULL);
+        free(jpeg_thread);
+        jpeg_thread = NULL;
+    }
 }
 
 struct buffer
@@ -498,9 +750,6 @@ static void *venc_read_stream(void *arg)
     free(stFrame.pstPack);
     return NULL;
 }
-
-uint32_t detected_width, detected_height;
-bool detected_signal = false, streaming_flag = false;
 
 pthread_t *streaming_thread = NULL;
 

@@ -12,4 +12,6 @@ void stop_ctrl_loop();
 
 void report_video_format(bool ready, const char *error, u_int16_t width, u_int16_t height, double frame_per_second);
 
+void report_jpeg_ready(const char *path);
+
 #endif //VIDEO_DAEMON_CTRL_H

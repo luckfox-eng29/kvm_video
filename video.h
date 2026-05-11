@@ -3,6 +3,11 @@
 
 #include <rk_common.h>
 
+typedef enum {
+    JPEG_SINGLE_SHOT,
+    JPEG_CONTINUOUS
+} JpegMode;
+
 typedef struct {
     RK_S32 s32FirstFrameStartQp;
     RK_U32 u32StepQp;
@@ -35,6 +40,10 @@ void video_set_encodec_type(RK_CODEC_ID_E type);
 void video_set_yolo_enable(int enable);
 void video_set_rc(const VideoRcConfig *rc);
 void video_get_rc(VideoRcConfig *rc);
+
+int video_jpeg_capture(JpegMode mode);
+int video_jpeg_get(void);
+void video_jpeg_stop(void);
 
 int udp_socket_init(int port);
 int udp_socket_send(const u_int8_t* frame, ssize_t len);

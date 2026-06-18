@@ -23,6 +23,9 @@
 #include <assert.h>
 #include <sys/un.h>
 #include <sys/socket.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "video.h"
 #include "ctrl.h"
 #include "yolo_c.h"
@@ -32,6 +35,7 @@
 
 #define VIDEO_DEV "/dev/video0"
 #define SUB_DEV "/dev/v4l-subdev2"
+#define HDMI_STATUS_FILE "/sys/kernel/debug/4-0050/hdmirx/status"
 
 #define RK_ALIGN(x, a) (((x) + (a)-1) & ~((a)-1))
 #define RK_ALIGN_2(x) RK_ALIGN(x, 2)
@@ -121,6 +125,29 @@ static int yolo_bound_fd = -1;
 
 static const int YOLO_MAX_DETS = 128;
 
+static bool check_hdmi_connection_from_debugfs()
+{
+    FILE *fp = fopen(HDMI_STATUS_FILE, "r");
+    if (fp == NULL) {
+        RK_LOGE("Failed to open HDMI status file: %s", HDMI_STATUS_FILE);
+        return false;
+    }
+
+    char line[512];
+    char status[32] = {0};
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        if (strncmp(line, "status:", 7) == 0) {
+            sscanf(line, "status: %s", status);
+            break;
+        }
+    }
+
+    fclose(fp);
+
+    RK_LOGI("HDMI status: %s", status);
+    return strcmp(status, "plugin") == 0;
+}
 
 RK_U64 get_us()
 {
@@ -962,7 +989,18 @@ void *run_video_stream(void *arg)
             if (r == 0)
             {
                 printf("select timeout \n");
-                break;
+                if (access(HDMI_STATUS_FILE, F_OK) == 0)
+                {
+                  bool hdmi_connected = check_hdmi_connection_from_debugfs();
+                  if (!hdmi_connected)
+                  {
+                    detected_signal = false;
+                    report_video_format(false, "no_signal", 0, 0, 0);
+                    break;
+                  }
+                } else {
+                    break;
+                }
             }
             if (r == -1)
             {
@@ -974,6 +1012,7 @@ void *run_video_stream(void *arg)
                 break;
             }
             memset(&buf, 0, sizeof(buf));
+            memset(&tmp_plane, 0, sizeof(tmp_plane));
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
             buf.memory = V4L2_MEMORY_DMABUF;
             buf.m.planes = &tmp_plane;
@@ -1185,6 +1224,7 @@ void *run_detect_format(void *arg)
     struct v4l2_event_subscription sub;
     struct v4l2_event ev;
     struct v4l2_dv_timings dv_timings;
+    bool hdmi_connected;
 
     memset(&sub, 0, sizeof(sub));
     sub.type = V4L2_EVENT_SOURCE_CHANGE;
@@ -1196,44 +1236,60 @@ void *run_detect_format(void *arg)
 
     while (!should_exit)
     {
-        memset(&dv_timings, 0, sizeof(dv_timings));
-        if (ioctl(sub_dev_fd, VIDIOC_QUERY_DV_TIMINGS, &dv_timings) != 0)
+        if (access(HDMI_STATUS_FILE, F_OK) == 0)
         {
-            detected_signal = false;
-            if (errno == ENOLINK)
+            hdmi_connected = check_hdmi_connection_from_debugfs();
+
+            ioctl(sub_dev_fd, VIDIOC_QUERY_DV_TIMINGS, &dv_timings);
+            if (!hdmi_connected)
             {
-                // No timings could be detected because no signal was found.
-                printf("HDMI status: no signal\n");
+                detected_signal = false;
+                memset(&dv_timings, 0, sizeof(dv_timings));
+                printf("HDMI status: disconnected (from debugfs)\n");
                 report_video_format(false, "no_signal", 0, 0, 0);
             }
-            else if (errno == ENOLCK)
+        } else {
+            memset(&dv_timings, 0, sizeof(dv_timings));
+            if (ioctl(sub_dev_fd, VIDIOC_QUERY_DV_TIMINGS, &dv_timings) != 0)
             {
-                // The signal was unstable and the hardware could not lock on to it.
-                printf("HDMI status: no lock\n");
-                report_video_format(false, "no_lock", 0, 0, 0);
-            }
-            else if (errno == ERANGE)
-            {
-                // Timings were found, but they are out of range of the hardware capabilities.
-                printf("HDMI status: out of range\n");
-                report_video_format(false, "out_of_range", 0, 0, 0);
-            }
-            else
-            {
-                perror("error VIDIOC_QUERY_DV_TIMINGS");
-                sleep(1);
-                continue;
+                detected_signal = false;
+                if (errno == ENOLINK)
+                {
+                    // No timings could be detected because no signal was found.
+                    printf("HDMI status: no signal\n");
+                    report_video_format(false, "no_signal", 0, 0, 0);
+                }
+                else if (errno == ENOLCK)
+                {
+                    // The signal was unstable and the hardware could not lock on to it.
+                    printf("HDMI status: no lock\n");
+                    report_video_format(false, "no_lock", 0, 0, 0);
+                }
+                else if (errno == ERANGE)
+                {
+                    // Timings were found, but they are out of range of the hardware capabilities.
+                    printf("HDMI status: out of range\n");
+                    report_video_format(false, "out_of_range", 0, 0, 0);
+                }
+                else
+                {
+                    perror("error VIDIOC_QUERY_DV_TIMINGS");
+                    sleep(1);
+                    continue;
+                }
             }
         }
-        else
+
+        if ((ioctl(sub_dev_fd, VIDIOC_QUERY_DV_TIMINGS, &dv_timings) != 0) ||
+          (hdmi_connected && dv_timings.bt.width > 0 && dv_timings.bt.height > 0))
         {
             printf("Active width: %d\n", dv_timings.bt.width);
             printf("Active height: %d\n", dv_timings.bt.height);
             double frames_per_second = (double)dv_timings.bt.pixelclock /
-                                       ((dv_timings.bt.height + dv_timings.bt.vfrontporch + dv_timings.bt.vsync +
-                                         dv_timings.bt.vbackporch) *
+                                      ((dv_timings.bt.height + dv_timings.bt.vfrontporch + dv_timings.bt.vsync +
+                                        dv_timings.bt.vbackporch) *
                                         (dv_timings.bt.width + dv_timings.bt.hfrontporch + dv_timings.bt.hsync +
-                                         dv_timings.bt.hbackporch));
+                                        dv_timings.bt.hbackporch));
             printf("Frames per second: %.2f fps\n", frames_per_second);
             detected_width = dv_timings.bt.width;
             detected_height = dv_timings.bt.height;
@@ -1246,6 +1302,7 @@ void *run_detect_format(void *arg)
                 video_start_streaming();
             }
         }
+
 
         memset(&ev, 0, sizeof(ev));
         if (ioctl(sub_dev_fd, VIDIOC_DQEVENT, &ev) != 0)

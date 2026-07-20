@@ -64,6 +64,7 @@ RK_CODEC_ID_E encodec_type = RK_VIDEO_ID_AVC;
 
 uint32_t detected_width, detected_height;
 bool detected_signal = false, streaming_flag = false;
+static pthread_mutex_t streaming_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static VideoRcConfig video_rc_config = {
     .h264 = {
@@ -341,6 +342,8 @@ static int32_t venc_stop()
 
     if (jpeg_running) {
         jpeg_running = false;
+    }
+    if (jpeg_initialized) {
         combo_jpeg_stop();
     }
 
@@ -685,11 +688,7 @@ int video_init()
     }
     printf("buf_init completed successfully\n");
 
-    if (yolo_init("/userdata/picokvm/model/yolov5.rknn") != 0) {
-        printf("yolov5 init failed\n");
-        return -1;
-    }
-    yolo_input_shape(&yolo_model_h, &yolo_model_w, &yolo_model_c);
+    // YOLOv5 model will be loaded on-demand when video_set_yolo_enable(true) is called
 
     format_thread = malloc(sizeof(pthread_t));
     pthread_create(format_thread, NULL, run_detect_format, NULL);
@@ -976,19 +975,22 @@ void *run_video_stream(void *arg)
         struct timeval tv;
         int r;
         uint32_t num = 0;
+        int select_timeout_count = 0;
         VIDEO_FRAME_INFO_S stFrame;
 
         while (streaming_flag)
         {
             FD_ZERO(&fds);
             FD_SET(video_dev_fd, &fds);
-            tv.tv_sec = 1;
-            tv.tv_usec = 0;
+            tv.tv_sec = 0;
+            tv.tv_usec = 500000; // 500ms timeout
 
             r = select(video_dev_fd + 1, &fds, NULL, NULL, &tv);
             if (r == 0)
             {
-                printf("select timeout \n");
+                select_timeout_count++;
+                printf("select timeout (count: %d)\n", select_timeout_count);
+
                 if (access(HDMI_STATUS_FILE, F_OK) == 0)
                 {
                   bool hdmi_connected = check_hdmi_connection_from_debugfs();
@@ -998,9 +1000,20 @@ void *run_video_stream(void *arg)
                     report_video_format(false, "no_signal", 0, 0, 0);
                     break;
                   }
-                } else {
+                }
+
+                if (select_timeout_count >= 3)
+                {
+                    printf("No data received for 1.5 seconds, signal lost\n");
+                    detected_signal = false;
+                    report_video_format(false, "no_signal", 0, 0, 0);
                     break;
                 }
+                continue;
+            }
+            else
+            {
+                select_timeout_count = 0;
             }
             if (r == -1)
             {
@@ -1187,26 +1200,35 @@ void video_shutdown()
 
 void video_start_streaming()
 {
+    pthread_mutex_lock(&streaming_mutex);
     if (streaming_thread != NULL)
     {
         printf("video streaming already started\n");
+        pthread_mutex_unlock(&streaming_mutex);
         return;
     }
     streaming_thread = malloc(sizeof(pthread_t));
     assert(streaming_thread != NULL);
     streaming_flag = true;
     pthread_create(streaming_thread, NULL, run_video_stream, NULL);
+    pthread_mutex_unlock(&streaming_mutex);
 }
 
 void video_stop_streaming()
 {
+    pthread_mutex_lock(&streaming_mutex);
     if (streaming_thread != NULL)
     {
         streaming_flag = false;
+        pthread_mutex_unlock(&streaming_mutex);
         pthread_join(*streaming_thread, NULL);
         free(streaming_thread);
         streaming_thread = NULL;
         printf("video streaming stopped\n");
+    }
+    else
+    {
+        pthread_mutex_unlock(&streaming_mutex);
     }
     if (yolo_thread != NULL) {
         yolo_running = false;
@@ -1224,7 +1246,7 @@ void *run_detect_format(void *arg)
     struct v4l2_event_subscription sub;
     struct v4l2_event ev;
     struct v4l2_dv_timings dv_timings;
-    bool hdmi_connected;
+    bool hdmi_connected = false;
 
     memset(&sub, 0, sizeof(sub));
     sub.type = V4L2_EVENT_SOURCE_CHANGE;
@@ -1236,38 +1258,81 @@ void *run_detect_format(void *arg)
 
     while (!should_exit)
     {
+        bool signal_detected = false;
+
         if (access(HDMI_STATUS_FILE, F_OK) == 0)
         {
             hdmi_connected = check_hdmi_connection_from_debugfs();
-
-            ioctl(sub_dev_fd, VIDIOC_QUERY_DV_TIMINGS, &dv_timings);
             if (!hdmi_connected)
             {
                 detected_signal = false;
-                memset(&dv_timings, 0, sizeof(dv_timings));
                 printf("HDMI status: disconnected (from debugfs)\n");
                 report_video_format(false, "no_signal", 0, 0, 0);
+                goto wait_event;
             }
-        } else {
+
+            memset(&dv_timings, 0, sizeof(dv_timings));
+            if (ioctl(sub_dev_fd, VIDIOC_QUERY_DV_TIMINGS, &dv_timings) == 0)
+            {
+                if (dv_timings.bt.width > 0 && dv_timings.bt.height > 0)
+                {
+                    bool timing_valid = true;
+                    if (dv_timings.bt.hsync == 0 || dv_timings.bt.vsync == 0)
+                    {
+                        printf("WARNING: Invalid timing - hs:%d, vs:%d\n",
+                               dv_timings.bt.hsync, dv_timings.bt.vsync);
+                        timing_valid = false;
+                    }
+
+                    if (dv_timings.bt.pixelclock == 0 || dv_timings.bt.pixelclock > 600000000)
+                    {
+                        printf("WARNING: Invalid pixelclock: %llu\n", dv_timings.bt.pixelclock);
+                        timing_valid = false;
+                    }
+
+                    if (timing_valid)
+                    {
+                        signal_detected = true;
+                    }
+                    else
+                    {
+                        printf("HDMI connected but timing invalid\n");
+                        detected_signal = false;
+                        report_video_format(false, "no_signal", 0, 0, 0);
+                    }
+                }
+                else
+                {
+                    printf("HDMI connected but invalid resolution: %dx%d\n", dv_timings.bt.width, dv_timings.bt.height);
+                    detected_signal = false;
+                    report_video_format(false, "no_signal", 0, 0, 0);
+                }
+            }
+            else
+            {
+                printf("HDMI connected but ioctl failed: %s\n", strerror(errno));
+                detected_signal = false;
+                report_video_format(false, "no_signal", 0, 0, 0);
+            }
+        }
+        else
+        {
             memset(&dv_timings, 0, sizeof(dv_timings));
             if (ioctl(sub_dev_fd, VIDIOC_QUERY_DV_TIMINGS, &dv_timings) != 0)
             {
                 detected_signal = false;
                 if (errno == ENOLINK)
                 {
-                    // No timings could be detected because no signal was found.
                     printf("HDMI status: no signal\n");
                     report_video_format(false, "no_signal", 0, 0, 0);
                 }
                 else if (errno == ENOLCK)
                 {
-                    // The signal was unstable and the hardware could not lock on to it.
                     printf("HDMI status: no lock\n");
                     report_video_format(false, "no_lock", 0, 0, 0);
                 }
                 else if (errno == ERANGE)
                 {
-                    // Timings were found, but they are out of range of the hardware capabilities.
                     printf("HDMI status: out of range\n");
                     report_video_format(false, "out_of_range", 0, 0, 0);
                 }
@@ -1278,10 +1343,16 @@ void *run_detect_format(void *arg)
                     continue;
                 }
             }
+            else
+            {
+                if (dv_timings.bt.width > 0 && dv_timings.bt.height > 0)
+                {
+                    signal_detected = true;
+                }
+            }
         }
 
-        if ((ioctl(sub_dev_fd, VIDIOC_QUERY_DV_TIMINGS, &dv_timings) != 0) ||
-          (hdmi_connected && dv_timings.bt.width > 0 && dv_timings.bt.height > 0))
+        if (signal_detected)
         {
             printf("Active width: %d\n", dv_timings.bt.width);
             printf("Active height: %d\n", dv_timings.bt.height);
@@ -1291,17 +1362,38 @@ void *run_detect_format(void *arg)
                                         (dv_timings.bt.width + dv_timings.bt.hfrontporch + dv_timings.bt.hsync +
                                         dv_timings.bt.hbackporch));
             printf("Frames per second: %.2f fps\n", frames_per_second);
+
+            bool resolution_changed = (detected_width != (uint32_t)dv_timings.bt.width ||
+                                       detected_height != (uint32_t)dv_timings.bt.height);
+            bool was_no_signal = !detected_signal;
             detected_width = dv_timings.bt.width;
             detected_height = dv_timings.bt.height;
             detected_signal = true;
             report_video_format(true, NULL, detected_width, detected_height, frames_per_second);
-            if (streaming_flag == true)
+
+            if (resolution_changed || was_no_signal)
             {
-                printf("restarting on going video streaming\n");
-                video_stop_streaming();
+                if (streaming_flag == true && !was_no_signal)
+                {
+                    printf("resolution changed, restarting video streaming\n");
+                    video_stop_streaming();
+                    usleep(200000);
+                }
                 video_start_streaming();
             }
+            else
+            {
+                printf("signal unchanged at %dx%d, no restart needed\n", detected_width, detected_height);
+            }
         }
+        else if (hdmi_connected)
+        {
+            detected_signal = false;
+            printf("HDMI connected but no valid signal\n");
+            report_video_format(false, "no_signal", 0, 0, 0);
+        }
+
+wait_event:
 
 
         memset(&ev, 0, sizeof(ev));
@@ -1316,6 +1408,7 @@ void *run_detect_format(void *arg)
             continue;
         }
         printf("source change detected!\n");
+        usleep(500000); // 500ms
     }
 exit:
     close(sub_dev_fd);
@@ -1355,6 +1448,14 @@ void video_set_yolo_enable(int enable)
     {
         if (!yolo_running)
         {
+            // Load model on-demand if not already loaded
+            if (yolo_model_w == 0 || yolo_model_h == 0) {
+                if (yolo_init("/userdata/picokvm/model/yolov5.rknn") != 0) {
+                    printf("yolov5 init failed\n");
+                    return;
+                }
+                yolo_input_shape(&yolo_model_h, &yolo_model_w, &yolo_model_c);
+            }
             yolo_running = true;
             if (yolo_thread == NULL)
             {
@@ -1377,8 +1478,13 @@ void video_set_yolo_enable(int enable)
                 free(yolo_thread);
                 yolo_thread = NULL;
             }
+            overlay_draw_detections(yolo_model_w, yolo_model_h, NULL, 0, 0x00FF00FF);
+            // Unload model to free NPU resources
+            yolo_deinit();
+            yolo_model_w = 0;
+            yolo_model_h = 0;
+            yolo_model_c = 0;
         }
-        overlay_draw_detections(yolo_model_w, yolo_model_h, NULL, 0, 0x00FF00FF);
     }
 }
 

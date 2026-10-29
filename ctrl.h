@@ -14,4 +14,8 @@ void report_video_format(bool ready, const char *error, u_int16_t width, u_int16
 
 void report_jpeg_ready(const char *path);
 
+// report_jpeg_failed tells the control client that a pending snapshot will never
+// produce a file, so it can abort instead of waiting out its own timeout.
+void report_jpeg_failed(const char *reason);
+
 #endif //VIDEO_DAEMON_CTRL_H

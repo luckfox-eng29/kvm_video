@@ -61,6 +61,14 @@ void report_jpeg_ready(const char *path)
     }
 }
 
+void report_jpeg_failed(const char *reason)
+{
+    if (ctrl_client_fd > 0)
+    {
+        write_json(ctrl_client_fd, "{event: %Q, data: {error: %Q}}", "jpeg_failed", reason);
+    }
+}
+
 void report_video_format(bool ready, const char *error, u_int16_t width, u_int16_t height, double frame_per_second)
 {
     state.ready = ready;

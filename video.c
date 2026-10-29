@@ -44,6 +44,15 @@
 
 #define COMBO_JPEG_CHN 1
 
+// A failed RK_MPI_VENC_GetStream() retries without sleeping would spin the single
+// Cortex-A7 core at 100% and starve the whole system.
+#define JPEG_GET_STREAM_MAX_FAILS 5
+
+// How long the snapshot thread waits for the encoder before telling the control
+// client that the pending request is stuck. Without this the client can only
+// report its own timeout, which says nothing about the actual cause.
+#define JPEG_VENC_WAIT_MAX_MS 1000
+
 int sub_dev_fd = -1;
 #define VENC_CHANNEL 0
 MB_POOL memPool = MB_INVALID_POOLID;
@@ -336,23 +345,43 @@ static int32_t venc_start(RK_CODEC_ID_E enType, int32_t bitrate, int32_t max_bit
     return RK_SUCCESS;
 }
 
+// Join and free the snapshot thread. combo_jpeg_get_stream exits when venc_running
+// goes false, so the thread is dead after every venc_stop(); without this the
+// dangling non-NULL jpeg_thread pointer makes video_jpeg_get() skip creating a new
+// thread and snapshots silently never complete again.
+static void jpeg_thread_join(void)
+{
+    if (jpeg_thread != NULL)
+    {
+        pthread_join(*jpeg_thread, NULL);
+        free(jpeg_thread);
+        jpeg_thread = NULL;
+    }
+}
+
 static int32_t venc_stop()
 {
     venc_running = false;
 
-    if (jpeg_running) {
-        jpeg_running = false;
-    }
-    if (jpeg_initialized) {
-        combo_jpeg_stop();
-    }
+    // jpeg_running/jpeg_trigger are written by video_jpeg_get() under jpeg_mutex, so
+    // update them under the same lock. The lock is released before the thread join
+    // below because combo_jpeg_get_stream() takes it as well.
+    pthread_mutex_lock(&jpeg_mutex);
+    jpeg_running = false;
+    jpeg_trigger = false;
+    pthread_mutex_unlock(&jpeg_mutex);
 
-    int32_t ret;
-    ret = RK_MPI_VENC_StopRecvFrame(VENC_CHANNEL);
-    if (ret != RK_SUCCESS)
+    int32_t ret = RK_SUCCESS;
+    int32_t r;
+
+    // Order matters: stop the producer, join the consumers, and only then destroy
+    // channels. Destroying COMBO_JPEG_CHN while a thread is blocked in
+    // RK_MPI_VENC_GetStream() hangs the encoder.
+    r = RK_MPI_VENC_StopRecvFrame(VENC_CHANNEL);
+    if (r != RK_SUCCESS)
     {
-        RK_LOGE("Failed to stop receiving frames for VENC_CHANNEL, error code: %d", ret);
-        return ret;
+        RK_LOGE("Failed to stop receiving frames for VENC_CHANNEL, error code: %d", r);
+        ret = r;
     }
 
     if (venc_read_thread != NULL)
@@ -362,14 +391,21 @@ static int32_t venc_stop()
         venc_read_thread = NULL;
     }
 
-    ret = RK_MPI_VENC_DestroyChn(VENC_CHANNEL);
-    if (ret != RK_SUCCESS)
+    jpeg_thread_join();
+
+    if (jpeg_initialized)
     {
-        RK_LOGE("Failed to destroy VENC_CHANNEL, error code: %d", ret);
-        return ret;
+        combo_jpeg_stop();
     }
 
-    return RK_SUCCESS;
+    r = RK_MPI_VENC_DestroyChn(VENC_CHANNEL);
+    if (r != RK_SUCCESS)
+    {
+        RK_LOGE("Failed to destroy VENC_CHANNEL, error code: %d", r);
+        ret = r;
+    }
+
+    return ret;
 }
 
 static int32_t combo_jpeg_init(RK_U32 width, RK_U32 height)
@@ -436,10 +472,20 @@ static int32_t combo_jpeg_stop(void)
     if (ret != RK_SUCCESS) {
         RK_LOGE("Failed to stop JPEG recv: %x", ret);
     }
+
     ret = RK_MPI_VENC_DestroyChn(COMBO_JPEG_CHN);
     if (ret != RK_SUCCESS) {
-        RK_LOGE("Failed to destroy JPEG chn: %x", ret);
+        RK_LOGE("Failed to destroy JPEG chn: %x, retrying once", ret);
+        usleep(20000);
+        ret = RK_MPI_VENC_DestroyChn(COMBO_JPEG_CHN);
     }
+    if (ret != RK_SUCCESS) {
+        // The channel still exists, so keep jpeg_initialized set: combo_jpeg_init()
+        // must not create a second channel on top of the surviving one.
+        RK_LOGE("Failed to destroy JPEG chn: %x, keeping channel state", ret);
+        return ret;
+    }
+
     jpeg_initialized = false;
     return ret;
 }
@@ -450,9 +496,25 @@ static void *combo_jpeg_get_stream(void *arg)
     FILE *fp = NULL;
     VENC_STREAM_S stFrame;
     VENC_RECV_PIC_PARAM_S stRecvParam;
+    int failCount = 0;
 
+    // Report a stuck encoder instead of waiting blind, but keep waiting: returning
+    // here would leave a dead thread behind and video_jpeg_get() would then skip
+    // creating a new one (see jpeg_thread_join()).
+    int waited_ms = 0;
     while (!venc_running) {
+        if (waited_ms >= JPEG_VENC_WAIT_MAX_MS) {
+            pthread_mutex_lock(&jpeg_mutex);
+            bool pending = jpeg_mode == JPEG_SINGLE_SHOT && jpeg_trigger;
+            jpeg_trigger = false;
+            pthread_mutex_unlock(&jpeg_mutex);
+            if (pending) {
+                report_jpeg_failed("VENC not running");
+            }
+            waited_ms = 0;
+        }
         usleep(10000);
+        waited_ms += 10;
     }
 
     stFrame.pstPack = malloc(sizeof(VENC_PACK_S));
@@ -477,6 +539,7 @@ static void *combo_jpeg_get_stream(void *arg)
 
         int s32Ret = RK_MPI_VENC_GetStream(COMBO_JPEG_CHN, &stFrame, 2000);
         if (s32Ret == RK_SUCCESS) {
+            failCount = 0;
             void *pData = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
 
             const char *path = "/userdata/picokvm/screenshot/kvm_screenshot.jpg";
@@ -491,6 +554,7 @@ static void *combo_jpeg_get_stream(void *arg)
                 report_jpeg_ready(path);
             } else {
                 RK_LOGE("Failed to open %s: %s", path, strerror(errno));
+                report_jpeg_failed("cannot write snapshot file");
             }
 
             RK_MPI_VENC_ReleaseStream(COMBO_JPEG_CHN, &stFrame);
@@ -507,7 +571,28 @@ static void *combo_jpeg_get_stream(void *arg)
             }
             pthread_mutex_unlock(&jpeg_mutex);
         } else {
-            RK_LOGE("RK_MPI_VENC_GetStream JPEG failed: %x", s32Ret);
+            // Never retry in a tight loop: this device is single-core.
+            if (failCount++ == 0) {
+                RK_LOGE("RK_MPI_VENC_GetStream JPEG failed: %x", s32Ret);
+            }
+            if (failCount >= JPEG_GET_STREAM_MAX_FAILS) {
+                // give up on the pending single-shot trigger instead of retrying forever
+                pthread_mutex_lock(&jpeg_mutex);
+                failCount = 0;
+                bool dropped = false;
+                if (jpeg_mode == JPEG_SINGLE_SHOT && jpeg_trigger) {
+                    jpeg_trigger = false;
+                    dropped = true;
+                }
+                pthread_mutex_unlock(&jpeg_mutex);
+                if (dropped) {
+                    // Somebody is waiting on a request that will never produce a file.
+                    report_jpeg_failed("VENC_GetStream failed");
+                }
+                usleep(100000);
+            } else {
+                usleep(10000);
+            }
         }
     }
 
@@ -578,6 +663,12 @@ int video_jpeg_get(void)
 
     pthread_mutex_unlock(&jpeg_mutex);
 
+    if (!jpeg_initialized) {
+        // Nothing will feed the channel, so the trigger above can never complete.
+        // Reported outside the lock: write_json() may block on the control socket.
+        report_jpeg_failed("JPEG channel not initialized");
+    }
+
     return 0;
 }
 
@@ -585,13 +676,10 @@ void video_jpeg_stop(void)
 {
     pthread_mutex_lock(&jpeg_mutex);
     jpeg_running = false;
+    jpeg_trigger = false;
     pthread_mutex_unlock(&jpeg_mutex);
 
-    if (jpeg_thread != NULL) {
-        pthread_join(*jpeg_thread, NULL);
-        free(jpeg_thread);
-        jpeg_thread = NULL;
-    }
+    jpeg_thread_join();
 }
 
 struct buffer
